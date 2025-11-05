@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/example/go-kafkalike/internal/api"
-	"github.com/example/go-kafkalike/internal/broker"
+	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/api"
+	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/broker"
 )
 
 func main() {

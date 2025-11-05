@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/example/go-kafkalike/internal/broker"
+	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/broker"
 )
 
 type Server struct {

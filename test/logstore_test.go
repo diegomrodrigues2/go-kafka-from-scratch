@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/example/go-kafkalike/internal/logstore"
+	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/logstore"
 )
 
 func TestAppendRead(t *testing.T) {
