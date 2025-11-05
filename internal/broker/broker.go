@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/example/go-kafkalike/internal/logstore"
+	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/logstore"
 )
 
 var ErrPartitionNotFound = errors.New("partition not found")
