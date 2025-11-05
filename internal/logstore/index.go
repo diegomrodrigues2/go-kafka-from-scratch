@@ -20,7 +20,7 @@ type indexFile struct {
 }
 
 func openIndex(path string) (*indexFile, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := openFileOp(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +33,7 @@ func openIndex(path string) (*indexFile, error) {
 }
 
 func (i *indexFile) load() error {
-	stat, err := i.file.Stat()
+	stat, err := statOp(i.file)
 	if err != nil {
 		return err
 	}
@@ -43,11 +43,11 @@ func (i *indexFile) load() error {
 	}
 	entries := make([]indexEntry, 0, size/8)
 	buf := make([]byte, 8)
-	if _, err := i.file.Seek(0, io.SeekStart); err != nil {
+	if _, err := seekOp(i.file, 0, io.SeekStart); err != nil {
 		return err
 	}
 	for {
-		if _, err := io.ReadFull(i.file, buf); err != nil {
+		if _, err := readFullOp(i.file, buf); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
@@ -63,7 +63,7 @@ func (i *indexFile) load() error {
 		entries = append(entries, entry)
 	}
 	i.entries = entries
-	if _, err := i.file.Seek(0, io.SeekEnd); err != nil {
+	if _, err := seekOp(i.file, 0, io.SeekEnd); err != nil {
 		return err
 	}
 	return nil

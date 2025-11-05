@@ -3,7 +3,6 @@ package logstore
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -19,7 +18,7 @@ type Log struct {
 }
 
 func Open(dir string, segmentBytes int64) (*Log, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := mkdirAllOp(dir, 0o755); err != nil {
 		return nil, err
 	}
 
@@ -30,7 +29,7 @@ func Open(dir string, segmentBytes int64) (*Log, error) {
 	}
 
 	if len(log.segments) == 0 {
-		seg, err := newSegment(dir, 0, segmentBytes)
+		seg, err := newSegmentOp(dir, 0, segmentBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -41,7 +40,7 @@ func Open(dir string, segmentBytes int64) (*Log, error) {
 }
 
 func (l *Log) loadSegments() error {
-	entries, err := os.ReadDir(l.dir)
+	entries, err := readDirOp(l.dir)
 	if err != nil {
 		return err
 	}
@@ -63,7 +62,7 @@ func (l *Log) loadSegments() error {
 	sort.Slice(bases, func(i, j int) bool { return bases[i] < bases[j] })
 
 	for _, base := range bases {
-		seg, err := newSegment(l.dir, base, l.segmentBytes)
+		seg, err := newSegmentOp(l.dir, base, l.segmentBytes)
 		if err != nil {
 			return err
 		}
@@ -101,9 +100,6 @@ func (l *Log) ReadFrom(offset uint64, maxBytes int) ([][]byte, uint64, error) {
 	}
 
 	segIdx := l.segmentIndex(offset)
-	if segIdx < 0 {
-		segIdx = 0
-	}
 
 	var records [][]byte
 	lastOffset := offset
@@ -158,7 +154,7 @@ func (l *Log) Close() error {
 }
 
 func (l *Log) newSegment(base uint64) (*Segment, error) {
-	return newSegment(l.dir, base, l.segmentBytes)
+	return newSegmentOp(l.dir, base, l.segmentBytes)
 }
 
 func (l *Log) segmentIndex(offset uint64) int {
