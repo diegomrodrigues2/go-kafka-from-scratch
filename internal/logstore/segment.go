@@ -25,25 +25,25 @@ func newSegment(dir string, baseOffset uint64, maxBytes int64) (*Segment, error)
 	logPath := filepath.Join(dir, logName)
 	idxPath := filepath.Join(dir, idxName)
 
-	store, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE, 0o644)
+	store, err := openFileOp(logPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
 	}
 
-	idx, err := openIndex(idxPath)
+	idx, err := openIndexOp(idxPath)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
 	}
 
-	stat, err := store.Stat()
+	stat, err := statOp(store)
 	if err != nil {
 		_ = store.Close()
 		_ = idx.close()
 		return nil, err
 	}
 
-	if _, err := store.Seek(0, io.SeekEnd); err != nil {
+	if _, err := seekOp(store, 0, io.SeekEnd); err != nil {
 		_ = store.Close()
 		_ = idx.close()
 		return nil, err
@@ -69,17 +69,17 @@ func (s *Segment) Append(value []byte) (uint64, error) {
 
 	off := s.nextOffset
 
-	pos, err := s.store.Seek(0, io.SeekEnd)
+	pos, err := seekOp(s.store, 0, io.SeekEnd)
 	if err != nil {
 		return 0, err
 	}
 
 	header := make([]byte, recordHeaderSize)
 	putRecordSize(header, len(value))
-	if _, err := s.store.Write(header); err != nil {
+	if _, err := writeOp(s.store, header); err != nil {
 		return 0, err
 	}
-	if _, err := s.store.Write(value); err != nil {
+	if _, err := writeOp(s.store, value); err != nil {
 		return 0, err
 	}
 
@@ -101,6 +101,8 @@ func (s *Segment) ReadFrom(offset uint64, maxBytes int) ([][]byte, uint64, int, 
 		return nil, offset, 0, nil
 	}
 
+	startOffset := offset
+
 	relStart := offset - s.baseOffset
 	startIndex := int(relStart)
 	if startIndex < 0 {
@@ -117,27 +119,20 @@ func (s *Segment) ReadFrom(offset uint64, maxBytes int) ([][]byte, uint64, int, 
 			break
 		}
 		absOffset := s.baseOffset + uint64(idx)
-		if absOffset < offset {
-			continue
-		}
-
-		if maxBytes > 0 && totalBytes >= maxBytes && len(records) > 0 {
-			break
-		}
 
 		pos := int64(entry.Position)
 		header := make([]byte, recordHeaderSize)
-		if _, err := s.store.ReadAt(header, pos); err != nil {
+		if _, err := readAtOp(s.store, header, pos); err != nil {
 			if errors.Is(err, io.EOF) {
-				break
+				return eofReturn(records, lastOffset, startOffset, totalBytes)
 			}
 			return records, lastOffset, totalBytes, err
 		}
 		size := readRecordSize(header)
 		recordBytes := make([]byte, size)
-		if _, err := s.store.ReadAt(recordBytes, pos+recordHeaderSize); err != nil {
+		if _, err := readAtOp(s.store, recordBytes, pos+recordHeaderSize); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				break
+				return eofReturn(records, lastOffset, startOffset, totalBytes)
 			}
 			return records, lastOffset, totalBytes, err
 		}
@@ -156,8 +151,12 @@ func (s *Segment) ReadFrom(offset uint64, maxBytes int) ([][]byte, uint64, int, 
 		}
 	}
 
+	return eofReturn(records, lastOffset, startOffset, totalBytes)
+}
+
+func eofReturn(records [][]byte, lastOffset, fallback uint64, totalBytes int) ([][]byte, uint64, int, error) {
 	if len(records) == 0 {
-		return nil, offset, totalBytes, nil
+		return nil, fallback, totalBytes, nil
 	}
 	return records, lastOffset, totalBytes, nil
 }
