@@ -13,6 +13,8 @@ import (
 	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/broker"
 )
 
+const headerReadMinOffset = "X-Read-Min-Offset"
+
 // Server exposes the broker API over HTTP.
 type Server struct {
 	b *broker.Broker
@@ -99,6 +101,53 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	minOffset, hasMin := uint64(0), false
+	if hdr := r.Header.Get(headerReadMinOffset); hdr != "" {
+		val, err := strconv.ParseUint(hdr, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid X-Read-Min-Offset", http.StatusBadRequest)
+			return
+		}
+		minOffset, hasMin = val, true
+	}
+	if qmin := r.URL.Query().Get("minOffset"); qmin != "" {
+		val, err := strconv.ParseUint(qmin, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid minOffset", http.StatusBadRequest)
+			return
+		}
+		minOffset, hasMin = val, true
+	}
+
+	if hasMin {
+		endOffset, err := s.b.EndOffset(topic, p)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if endOffset <= minOffset {
+			isLeader, err := s.b.IsLeader(topic, p)
+			if err != nil && !errors.Is(err, broker.ErrPartitionNotFound) {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if !isLeader {
+				leaderID, leaderAddr, leaderErr := s.b.PartitionLeader(topic, p)
+				if leaderErr != nil {
+					http.Error(w, leaderErr.Error(), http.StatusServiceUnavailable)
+					return
+				}
+				if loc, buildErr := buildPartitionFetchURL(leaderAddr, topic, p, off, max, minOffset, true); buildErr == nil {
+					w.Header().Set("Location", loc)
+				}
+				http.Error(w, fmt.Sprintf("redirect to leader %d for consistent read", leaderID), http.StatusTemporaryRedirect)
+				return
+			}
+			http.Error(w, "requested offset not yet available", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	recs, last, err := s.b.Fetch(topic, p, off, max)
 	if err != nil {
 		if errors.Is(err, broker.ErrPartitionNotFound) {
@@ -131,5 +180,24 @@ func buildPartitionPublishURL(baseAddr, topic string, partition int) (string, er
 	}
 	topicEscaped := url.PathEscape(topic)
 	u.Path = path.Join(u.Path, "topics", topicEscaped, "partitions", strconv.Itoa(partition))
+	return u.String(), nil
+}
+
+func buildPartitionFetchURL(baseAddr, topic string, partition int, offset uint64, maxBytes int, minOffset uint64, includeMin bool) (string, error) {
+	u, err := url.Parse(baseAddr)
+	if err != nil {
+		return "", err
+	}
+	topicEscaped := url.PathEscape(topic)
+	u.Path = path.Join(u.Path, "topics", topicEscaped, "partitions", strconv.Itoa(partition), "fetch")
+	q := u.Query()
+	q.Set("offset", strconv.FormatUint(offset, 10))
+	if maxBytes > 0 {
+		q.Set("maxBytes", strconv.Itoa(maxBytes))
+	}
+	if includeMin {
+		q.Set("minOffset", strconv.FormatUint(minOffset, 10))
+	}
+	u.RawQuery = q.Encode()
 	return u.String(), nil
 }

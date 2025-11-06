@@ -228,6 +228,15 @@ func (b *Broker) Fetch(topic string, partition int, offset uint64, maxBytes int)
 	return lg.ReadFrom(offset, maxBytes)
 }
 
+// EndOffset returns the next offset that will be assigned for the partition.
+func (b *Broker) EndOffset(topic string, partition int) (uint64, error) {
+	lg, err := b.getPartition(topic, partition)
+	if err != nil {
+		return 0, err
+	}
+	return lg.NextOffset(), nil
+}
+
 // Topics lists the names of the topics currently loaded on this broker.
 func (b *Broker) Topics() []string {
 	b.mu.RLock()
@@ -297,6 +306,19 @@ func (b *Broker) PartitionLeader(topic string, partition int) (int, string, erro
 		return assign.Leader, addr, ErrLeaderNotAvailable
 	}
 	return assign.Leader, addr, nil
+}
+
+// IsLeader reports whether this broker is the current leader for the partition.
+func (b *Broker) IsLeader(topic string, partition int) (bool, error) {
+	cluster := b.conf.Cluster
+	if cluster == nil || cluster.BrokerID == 0 {
+		return true, nil
+	}
+	assign, ok := b.partitionAssignment(topic, partition)
+	if !ok {
+		return false, ErrPartitionNotFound
+	}
+	return assign.Leader == cluster.BrokerID, nil
 }
 
 // partitionAssignment looks up the assignment entry for a topic-partition pair.

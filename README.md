@@ -1,6 +1,6 @@
 # Go Kafka From Scratch
 
-A simplified Kafka-like message broker implementation in Go, demonstrating core distributed log concepts: append-only logs, offset-based consumption, and segment-based storage.
+A simplified Kafka-like message broker implementation in Go, demonstrating core distributed log concepts—append-only logs, offset-based consumption, segment-based storage—and now single-leader replication with follower catch-up.
 
 ## Architecture Overview
 
@@ -30,6 +30,7 @@ graph TB
     Producer -->|"POST /topics/{topic}/partitions/{p}"| HTTP
     Consumer -->|"GET /topics/{topic}/partitions/{p}/fetch"| HTTP
     HTTP --> Broker
+    Broker -->|"async fetch"| Follower[Follower Replicator]
     Broker --> Log
     Log --> Segment
     Segment --> Index
@@ -38,13 +39,14 @@ graph TB
 ## Core Modules
 
 ### 1. Broker (`internal/broker/`)
-Manages multiple topics and partitions, routing requests to appropriate logs.
+Manages multiple topics and partitions, routing requests to appropriate logs and coordinating replication when cluster metadata is configured.
 
 **Key Operations:**
 - `EnsurePartition()` - Create/ensure partition exists
 - `Publish()` - Append messages to partition
 - `Fetch()` - Read messages from offset
 - `Topics()` - List available topics
+- `PartitionLeader()` - Discover the leader for a topic-partition
 
 ### 2. LogStore (`internal/logstore/`)
 Storage engine with three components:
@@ -54,19 +56,22 @@ Storage engine with three components:
 - **Index** (`index.go`) - Maps offsets to file positions
 
 ### 3. API Layer (`internal/api/`)
-HTTP REST API exposing broker operations:
+HTTP REST API exposing broker operations and enforcing consistency hints (for example, `X-Read-Min-Offset` to divert lagging followers).
 
 ```
-POST   /topics/{topic}/partitions/{p}           → Publish message
-GET    /topics/{topic}/partitions/{p}/fetch     → Fetch messages
+POST   /topics/{topic}/partitions/{p}           ? Publish message
+GET    /topics/{topic}/partitions/{p}/fetch     ? Fetch messages (?minOffset= / X-Read-Min-Offset supported)
 ```
 
 ### 4. Client Libraries (`pkg/client/`)
-High-level APIs for producers and consumers.
+High-level APIs for producers and consumers, plus session helpers that remember per-topic offsets to deliver read-your-writes and monotonic reads across replicas.
+
+### 5. Replication (`internal/broker/replication.go`)
+Background worker that keeps follower replicas in sync by polling the leader via the HTTP fetch API and appending records locally using the existing logstore.
 
 ## Data Flow Diagrams
 
-### Message Publishing Flow
+### Message Publishing Flow (Leader)
 
 ```mermaid
 sequenceDiagram
@@ -89,6 +94,27 @@ sequenceDiagram
     L-->>B: Offset returned
     B-->>API: Offset returned
     API-->>P: {"offset": 42}
+```
+
+### Replication Flow (Follower)
+
+```mermaid
+sequenceDiagram
+    participant F as Follower Broker
+    participant R as Replicator Goroutine
+    participant L as Leader Broker
+    participant LL as Leader Log
+    participant FL as Follower Log
+
+    loop every fetch interval
+        R->>L: GET /topics/demo/partitions/0/fetch?offset=n
+        L->>LL: ReadFrom(n)
+        LL-->>L: records, lastOffset
+        L-->>R: JSON payload
+        R->>FL: Append(record)
+        FL-->>R: offset assigned
+        R->>R: advance next offset
+    end
 ```
 
 ### Message Consumption Flow
@@ -260,6 +286,48 @@ consumer := client.Consumer{BaseURL: "http://localhost:8080"}
 records, lastOffset, err := consumer.Fetch("demo", 0, 0, 1024)
 ```
 
+### Consistency-Aware Sessions
+
+```go
+session, err := client.NewSession(client.SessionConfig{
+    SessionID:    "user-123",                     // stick reads to the same follower
+    LeaderURL:    "http://leader:8080",           // leader handles writes and lag-free reads
+    FollowerURLs: []string{"http://follower:8081"},
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+off, _ := session.Publish("demo", 0, []byte("hello"))
+records, last, _ := session.Fetch("demo", 0, off, 0) // guaranteed to see the write
+```
+
+The session automatically adds `minOffset`/`X-Read-Min-Offset` when reading from followers and falls back to the leader if a replica is behind, ensuring read-your-writes and monotonic reads.
+
+
+### Running a Follower Replica (Programmatic Example)
+
+Replication is activated when the broker is supplied with cluster metadata describing leaders, peers and replica sets. While the CLI entry point (`cmd/broker/main.go`) runs a standalone node, you can wire followers programmatically:
+
+```go
+cluster := &broker.ClusterConfig{
+    BrokerID: 2, // this broker id
+    Peers: map[int]string{
+        1: "http://localhost:8080", // leader base URL
+    },
+    Partitions: map[string]map[int]broker.PartitionAssignment{
+        "demo": {
+            0: {Leader: 1, Replicas: []int{1, 2}},
+        },
+    },
+}
+follower := broker.NewBroker(broker.Config{Cluster: cluster})
+follower.SetHTTPClient(&http.Client{Timeout: time.Second}) // optional custom client
+_ = follower.EnsurePartition("demo", 0, "./data/topic=demo-part=0", 128<<20)
+```
+
+Once configured, the follower will continuously poll the leader’s fetch endpoint and mirror the log locally. Writes issued to a follower via the HTTP API are rejected with a redirect to the leader.
+
 ## Design Decisions
 
 ### Strengths
@@ -267,11 +335,14 @@ records, lastOffset, err := consumer.Fetch("demo", 0, 0, 1024)
 - Clean separation of concerns
 - Excellent testability (100% test coverage)
 - Segment-based storage (scalable)
+- Asynchronous single-leader replication for higher availability
+- Optional client sessions offer read-your-writes and monotonic reads
 - Standard Go project layout
 
 ### Limitations
-- No replication (single point of failure)
-- No clustering support
+- Static cluster assignments (no controller or dynamic rebalancing)
+- No automatic leader failover or election
+- Client-managed consistency (sessions must steer reads to suitable replicas)
 - No consumer groups or offset commits
 - No retention policies or compaction
 - No authentication/authorization
