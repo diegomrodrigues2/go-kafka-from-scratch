@@ -69,10 +69,16 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Convert [][]byte to []string so JSON encoding returns plain text instead of base64
+	records := make([]string, len(recs))
+	for i, rec := range recs {
+		records[i] = string(rec)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"fromOffset": off,
 		"toOffset":   last,
-		"records":    recs,
+		"records":    records,
 	})
 }
