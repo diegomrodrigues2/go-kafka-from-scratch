@@ -16,6 +16,7 @@ var (
 	exitFn         = os.Exit
 )
 
+// main runs the standalone broker process.
 func main() {
 	if err := run(); err != nil {
 		log.Printf("broker error: %v", err)
@@ -23,12 +24,15 @@ func main() {
 	}
 }
 
+// run initialises the broker, wires the HTTP API and starts listening for
+// client requests.
 func run() error {
 	dataDir := getenv("DATA_DIR", "./data")
 	topic := getenv("TOPIC", "demo")
 	partition := 0
 
 	b := broker.NewBroker()
+	defer func() { _ = b.Close() }()
 	if err := mkdirAll(dataDir, 0o755); err != nil {
 		return err
 	}
@@ -44,6 +48,8 @@ func run() error {
 	return listenAndServe(addr, mux)
 }
 
+// getenv returns the environment variable value falling back to a default when
+// it is not set.
 func getenv(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v

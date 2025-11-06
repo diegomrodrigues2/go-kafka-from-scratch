@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/broker"
 )
@@ -82,8 +83,60 @@ func TestServerPublishBrokerError(t *testing.T) {
 	req.SetPathValue("p", "0")
 	rec := httptest.NewRecorder()
 	srv.handlePublish(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 got %d", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rec.Code)
+	}
+}
+
+// TestServerPublishRedirectsToLeader verifies the API hints clients to publish
+// to the leader when the current broker is a follower.
+func TestServerPublishRedirectsToLeader(t *testing.T) {
+	leaderMux := http.NewServeMux()
+	leaderMux.HandleFunc("/topics/demo/partitions/0/fetch", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"fromOffset":0,"toOffset":0,"records":[]}`))
+	})
+	leaderSrv := httptest.NewServer(leaderMux)
+	t.Cleanup(leaderSrv.Close)
+
+	cfg := broker.Config{
+		Cluster: &broker.ClusterConfig{
+			BrokerID: 2,
+			Peers: map[int]string{
+				1: leaderSrv.URL,
+			},
+			Partitions: map[string]map[int]broker.PartitionAssignment{
+				"demo": {0: {Leader: 1, Replicas: []int{1, 2}}},
+			},
+			ReplicaFetchInterval: 10 * time.Millisecond,
+			ReplicaRetryInterval: 10 * time.Millisecond,
+		},
+	}
+	b := broker.NewBroker(cfg)
+	b.SetHTTPClient(leaderSrv.Client())
+	dir := t.TempDir()
+	partPath := filepath.Join(dir, "topic=demo-part=0")
+	if err := b.EnsurePartition("demo", 0, partPath, 128); err != nil {
+		t.Fatalf("ensure partition: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+
+	srv := NewHTTP(b)
+	req := httptest.NewRequest(http.MethodPost, "/topics/demo/partitions/0", bytes.NewReader([]byte("payload")))
+	req.SetPathValue("topic", "demo")
+	req.SetPathValue("p", "0")
+	rec := httptest.NewRecorder()
+	srv.handlePublish(rec, req)
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected redirect got %d", rec.Code)
+	}
+	location := rec.Header().Get("Location")
+	expected, err := buildPartitionPublishURL(leaderSrv.URL, "demo", 0)
+	if err != nil {
+		t.Fatalf("build url: %v", err)
+	}
+	if location != expected {
+		t.Fatalf("expected location %s got %s", expected, location)
 	}
 }
 
@@ -155,8 +208,8 @@ func TestServerFetchBrokerError(t *testing.T) {
 	req.SetPathValue("p", "0")
 	rec := httptest.NewRecorder()
 	srv.handleFetch(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 got %d", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rec.Code)
 	}
 }
 

@@ -65,6 +65,39 @@ func TestBrokerErrors(t *testing.T) {
 	}
 }
 
+// TestBrokerPublishNotLeader makes sure followers refuse direct client writes
+// and surface leader discovery information.
+func TestBrokerPublishNotLeader(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		Cluster: &ClusterConfig{
+			BrokerID: 2,
+			Partitions: map[string]map[int]PartitionAssignment{
+				"demo": {0: {Leader: 1, Replicas: []int{1, 2}}},
+			},
+		},
+	}
+	b := NewBroker(cfg)
+	defer func() { _ = b.Close() }()
+	partPath := filepath.Join(dir, "topic=demo-part=0")
+	if err := b.EnsurePartition("demo", 0, partPath, 64); err != nil {
+		t.Fatalf("ensure partition: %v", err)
+	}
+	if _, err := b.Publish("demo", 0, nil, []byte("x")); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("expected ErrNotLeader got %v", err)
+	}
+	leaderID, addr, err := b.PartitionLeader("demo", 0)
+	if leaderID != 1 {
+		t.Fatalf("expected leader id 1 got %d", leaderID)
+	}
+	if !errors.Is(err, ErrLeaderNotAvailable) {
+		t.Fatalf("expected ErrLeaderNotAvailable got %v", err)
+	}
+	if addr != "" {
+		t.Fatalf("expected empty leader address got %s", addr)
+	}
+}
+
 func TestBrokerCloseError(t *testing.T) {
 	dir := t.TempDir()
 	b := NewBroker()

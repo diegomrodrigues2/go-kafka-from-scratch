@@ -7,6 +7,8 @@ import (
 	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/logstore"
 )
 
+// TestAppendRead verifies log segments persist offsets and remain appendable
+// after reopening the log.
 func TestAppendRead(t *testing.T) {
 	dir := t.TempDir()
 	lg, err := logstore.Open(filepath.Join(dir, "log"), 1<<20)
@@ -39,6 +41,9 @@ func TestAppendRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		_ = lg2.Close()
+	}()
 
 	off, err := lg2.Append([]byte("X"))
 	if err != nil {

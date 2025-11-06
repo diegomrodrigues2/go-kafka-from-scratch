@@ -178,3 +178,12 @@ func (l *Log) String() string {
 	defer l.mu.RUnlock()
 	return fmt.Sprintf("Log{path=%s segments=%d}", l.dir, len(l.segments))
 }
+
+func (l *Log) NextOffset() uint64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if len(l.segments) == 0 {
+		return 0
+	}
+	return l.segments[len(l.segments)-1].NextOffset()
+}
