@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,28 +12,31 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/logstore"
 )
 
 // followerReplicator continuously pulls data from the leader and appends it to
 // the local log to keep this broker's replica up to date.
 type followerReplicator struct {
-	topic         string
-	partition     int
-	log           *logstore.Log
-	leaderAddr    string
-	client        *http.Client
-	fetchInterval time.Duration
-	retryInterval time.Duration
-	stopCh        chan struct{}
-	doneCh        chan struct{}
+	broker          *Broker
+	topic           string
+	partition       int
+	part            *partitionLog
+	leaderAddr      string
+	client          *http.Client
+	fetchInterval   time.Duration
+	retryInterval   time.Duration
+	failoverTimeout time.Duration
+	stopCh          chan struct{}
+	doneCh          chan struct{}
+	onStopped       func()
+	promoted        atomic.Bool
 }
 
 // newFollowerReplicator wires together the helper responsible for fetching
 // from the leader. Tests can pass a custom HTTP client or timing configuration.
-func newFollowerReplicator(topic string, partition int, lg *logstore.Log, leaderAddr string, client *http.Client, fetchInterval, retryInterval time.Duration) *followerReplicator {
+func newFollowerReplicator(b *Broker, topic string, partition int, pl *partitionLog, leaderAddr string, client *http.Client, fetchInterval, retryInterval, failoverTimeout time.Duration) *followerReplicator {
 	if client == nil {
 		client = newDefaultHTTPClient()
 	}
@@ -42,16 +46,21 @@ func newFollowerReplicator(topic string, partition int, lg *logstore.Log, leader
 	if retryInterval <= 0 {
 		retryInterval = defaultReplicaRetryInterval
 	}
+	if failoverTimeout <= 0 {
+		failoverTimeout = defaultFailoverTimeout
+	}
 	return &followerReplicator{
-		topic:         topic,
-		partition:     partition,
-		log:           lg,
-		leaderAddr:    leaderAddr,
-		client:        client,
-		fetchInterval: fetchInterval,
-		retryInterval: retryInterval,
-		stopCh:        make(chan struct{}),
-		doneCh:        make(chan struct{}),
+		broker:          b,
+		topic:           topic,
+		partition:       partition,
+		part:            pl,
+		leaderAddr:      leaderAddr,
+		client:          client,
+		fetchInterval:   fetchInterval,
+		retryInterval:   retryInterval,
+		failoverTimeout: failoverTimeout,
+		stopCh:          make(chan struct{}),
+		doneCh:          make(chan struct{}),
 	}
 }
 
@@ -79,7 +88,14 @@ func (fr *followerReplicator) stop() {
 // waiting briefly when no new data is available.
 func (fr *followerReplicator) run() {
 	defer close(fr.doneCh)
-	offset := fr.log.NextOffset()
+	if fr.onStopped != nil {
+		defer fr.onStopped()
+	}
+	if fr.part == nil {
+		return
+	}
+	offset := fr.part.nextOffset()
+	lastSuccess := time.Now()
 	for {
 		select {
 		case <-fr.stopCh:
@@ -90,11 +106,17 @@ func (fr *followerReplicator) run() {
 		records, lastOffset, err := fr.fetch(offset)
 		if err != nil {
 			log.Printf("follower replicate topic=%s partition=%d fetch error: %v", fr.topic, fr.partition, err)
+			if fr.failoverTimeout > 0 && time.Since(lastSuccess) >= fr.failoverTimeout {
+				if fr.triggerPromotion(err) {
+					return
+				}
+			}
 			if !fr.wait(fr.retryInterval) {
 				return
 			}
 			continue
 		}
+		lastSuccess = time.Now()
 
 		if len(records) == 0 {
 			if !fr.wait(fr.fetchInterval) {
@@ -106,13 +128,15 @@ func (fr *followerReplicator) run() {
 		nextOffset := offset
 		appendErr := false
 		for _, rec := range records {
-			appended, err := fr.log.Append(rec)
+			appendedOffset, appended, err := fr.part.appendReplica(rec)
 			if err != nil {
 				log.Printf("follower replicate topic=%s partition=%d append error: %v", fr.topic, fr.partition, err)
 				appendErr = true
 				break
 			}
-			nextOffset = appended + 1
+			if appended {
+				nextOffset = appendedOffset + 1
+			}
 		}
 
 		if appendErr {
@@ -145,47 +169,198 @@ func (fr *followerReplicator) wait(delay time.Duration) bool {
 	}
 }
 
+// triggerPromotion asks the broker to promote this replica to leader.
+func (fr *followerReplicator) triggerPromotion(cause error) bool {
+	if fr.broker == nil {
+		return false
+	}
+	if !fr.promoted.CompareAndSwap(false, true) {
+		return false
+	}
+	log.Printf("follower topic=%s partition=%d initiating promotion: %v", fr.topic, fr.partition, cause)
+	go fr.broker.handleReplicaPromotion(fr.topic, fr.partition)
+	return true
+}
+
 // fetch retrieves records from the leader starting at the supplied offset and
 // returns the payload alongside the highest offset fetched.
 func (fr *followerReplicator) fetch(offset uint64) ([][]byte, uint64, error) {
-	urlStr, err := fr.buildFetchURL(offset)
+	return fetchPartitionBatch(fr.client, fr.leaderAddr, fr.topic, fr.partition, offset)
+}
+
+type peerReplicator struct {
+	broker        *Broker
+	topic         string
+	partition     int
+	peerID        int
+	peerAddr      string
+	part          *partitionLog
+	client        *http.Client
+	fetchInterval time.Duration
+	retryInterval time.Duration
+	stopCh        chan struct{}
+	doneCh        chan struct{}
+}
+
+func newPeerReplicator(b *Broker, topic string, partition int, peerID int, peerAddr string, pl *partitionLog, client *http.Client, fetchInterval, retryInterval time.Duration) *peerReplicator {
+	if client == nil {
+		client = newDefaultHTTPClient()
+	}
+	if fetchInterval <= 0 {
+		fetchInterval = defaultReplicaFetchInterval
+	}
+	if retryInterval <= 0 {
+		retryInterval = defaultReplicaRetryInterval
+	}
+	return &peerReplicator{
+		broker:        b,
+		topic:         topic,
+		partition:     partition,
+		peerID:        peerID,
+		peerAddr:      peerAddr,
+		part:          pl,
+		client:        client,
+		fetchInterval: fetchInterval,
+		retryInterval: retryInterval,
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
+	}
+}
+
+func (pr *peerReplicator) start(wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		pr.run()
+	}()
+}
+
+func (pr *peerReplicator) stop() {
+	select {
+	case <-pr.stopCh:
+	default:
+		close(pr.stopCh)
+	}
+	<-pr.doneCh
+}
+
+func (pr *peerReplicator) run() {
+	defer close(pr.doneCh)
+	if pr.part == nil {
+		return
+	}
+	offset := uint64(0)
+	for {
+		select {
+		case <-pr.stopCh:
+			return
+		default:
+		}
+
+		records, lastOffset, err := fetchPartitionBatch(pr.client, pr.peerAddr, pr.topic, pr.partition, offset)
+		if err != nil {
+			log.Printf("peer replicate topic=%s partition=%d peer=%d fetch error: %v", pr.topic, pr.partition, pr.peerID, err)
+			if !pr.wait(pr.retryInterval) {
+				return
+			}
+			continue
+		}
+
+		if len(records) == 0 {
+			if lastOffset+1 > offset {
+				offset = lastOffset + 1
+			}
+			if !pr.wait(pr.fetchInterval) {
+				return
+			}
+			continue
+		}
+
+		appendErr := false
+		for _, rec := range records {
+			if _, _, err := pr.part.appendReplica(rec); err != nil {
+				log.Printf("peer replicate topic=%s partition=%d peer=%d append error: %v", pr.topic, pr.partition, pr.peerID, err)
+				appendErr = true
+				break
+			}
+		}
+		if appendErr {
+			if !pr.wait(pr.retryInterval) {
+				return
+			}
+			continue
+		}
+		if lastOffset+1 > offset {
+			offset = lastOffset + 1
+		}
+	}
+}
+
+func (pr *peerReplicator) wait(delay time.Duration) bool {
+	if delay <= 0 {
+		delay = defaultReplicaFetchInterval
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-pr.stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func fetchPartitionBatch(client *http.Client, baseAddr, topic string, partition int, offset uint64) ([][]byte, uint64, error) {
+	urlStr, err := buildReplicaFetchURL(baseAddr, topic, partition, offset)
 	if err != nil {
 		return nil, offset, err
 	}
-	resp, err := fr.client.Get(urlStr)
+	resp, err := client.Get(urlStr)
 	if err != nil {
 		return nil, offset, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, offset, fmt.Errorf("fetch from leader returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, offset, fmt.Errorf("fetch from peer returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var payload struct {
-		ToOffset uint64   `json:"toOffset"`
-		Records  []string `json:"records"`
+		ToOffset   uint64   `json:"toOffset"`
+		Records    []string `json:"records"`
+		RawRecords []string `json:"rawRecords"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, offset, err
 	}
-	result := make([][]byte, len(payload.Records))
-	for i, rec := range payload.Records {
-		result[i] = []byte(rec)
+	var result [][]byte
+	if len(payload.RawRecords) > 0 {
+		result = make([][]byte, len(payload.RawRecords))
+		for i, raw := range payload.RawRecords {
+			val, err := base64.StdEncoding.DecodeString(raw)
+			if err != nil {
+				return nil, offset, err
+			}
+			result[i] = val
+		}
+	} else {
+		result = make([][]byte, len(payload.Records))
+		for i, rec := range payload.Records {
+			result[i] = []byte(rec)
+		}
 	}
 	return result, payload.ToOffset, nil
 }
 
-// buildFetchURL constructs the leader fetch endpoint including the next offset
-// to be replicated.
-func (fr *followerReplicator) buildFetchURL(offset uint64) (string, error) {
-	base, err := url.Parse(fr.leaderAddr)
+func buildReplicaFetchURL(baseAddr, topic string, partition int, offset uint64) (string, error) {
+	base, err := url.Parse(baseAddr)
 	if err != nil {
 		return "", err
 	}
-	topicEscaped := url.PathEscape(fr.topic)
-	base.Path = path.Join(base.Path, "topics", topicEscaped, "partitions", strconv.Itoa(fr.partition), "fetch")
+	topicEscaped := url.PathEscape(topic)
+	base.Path = path.Join(base.Path, "topics", topicEscaped, "partitions", strconv.Itoa(partition), "fetch")
 	q := base.Query()
 	q.Set("offset", strconv.FormatUint(offset, 10))
+	q.Set("raw", "1")
 	base.RawQuery = q.Encode()
 	return base.String(), nil
 }

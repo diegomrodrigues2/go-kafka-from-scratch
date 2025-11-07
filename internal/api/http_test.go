@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,6 +197,72 @@ func TestServerFetchInvalidMaxBytes(t *testing.T) {
 	srv.handleFetch(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected bad request got %d", rec.Code)
+	}
+}
+
+func TestServerPartitionInfo(t *testing.T) {
+	cfg := broker.Config{
+		Cluster: &broker.ClusterConfig{
+			BrokerID: 1,
+			Partitions: map[string]map[int]broker.PartitionAssignment{
+				"demo": {0: {Leader: 1, Replicas: []int{1, 2}, Epoch: 3}},
+			},
+		},
+	}
+	b := broker.NewBroker(cfg)
+	dir := t.TempDir()
+	partPath := filepath.Join(dir, "topic=demo-part=0")
+	if err := b.EnsurePartition("demo", 0, partPath, 64); err != nil {
+		t.Fatalf("ensure partition: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/cluster/topics/demo/partitions/0", nil)
+	req.SetPathValue("topic", "demo")
+	req.SetPathValue("p", "0")
+	NewHTTP(b).handlePartitionInfo(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"leader":1`) || !strings.Contains(body, `"epoch":3`) {
+		t.Fatalf("unexpected body %s", body)
+	}
+}
+
+func TestServerUpdateLeader(t *testing.T) {
+	cfg := broker.Config{
+		Cluster: &broker.ClusterConfig{
+			BrokerID: 2,
+			Partitions: map[string]map[int]broker.PartitionAssignment{
+				"demo": {0: {Leader: 1, Replicas: []int{1, 2}}},
+			},
+		},
+	}
+	b := broker.NewBroker(cfg)
+	dir := t.TempDir()
+	partPath := filepath.Join(dir, "topic=demo-part=0")
+	if err := b.EnsurePartition("demo", 0, partPath, 64); err != nil {
+		t.Fatalf("ensure partition: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+
+	req := httptest.NewRequest(http.MethodPost, "/cluster/topics/demo/partitions/0/leader", bytes.NewReader([]byte(`{"leaderId":2,"epoch":1}`)))
+	req.SetPathValue("topic", "demo")
+	req.SetPathValue("p", "0")
+	rec := httptest.NewRecorder()
+	NewHTTP(b).handleUpdateLeader(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 got %d", rec.Code)
+	}
+
+	assign, err := b.PartitionAssignment("demo", 0)
+	if err != nil {
+		t.Fatalf("assignment: %v", err)
+	}
+	if assign.Leader != 2 || assign.Epoch != 1 {
+		t.Fatalf("expected leader 2 epoch 1 got %+v", assign)
 	}
 }
 

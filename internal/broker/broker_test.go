@@ -32,7 +32,7 @@ func TestBrokerEnsurePublishFetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	if len(recs) != 1 || string(recs[0]) != "value" || last != 0 {
+	if len(recs) != 1 || string(recs[0].Payload) != "value" || last != 0 {
 		t.Fatalf("unexpected fetch result len=%d last=%d", len(recs), last)
 	}
 
@@ -108,7 +108,7 @@ func TestBrokerCloseError(t *testing.T) {
 	}
 
 	for _, lg := range b.logs["demo"] {
-		if err := lg.Close(); err != nil {
+		if err := lg.close(); err != nil {
 			t.Fatalf("close partition log: %v", err)
 		}
 	}
@@ -136,5 +136,61 @@ func TestBrokerEnsurePartitionError(t *testing.T) {
 	}
 	if err := b.EnsurePartition("demo", 0, partPath, 64); err == nil {
 		t.Fatalf("expected ensure partition error")
+	}
+}
+
+func TestBrokerSetPartitionLeader(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		Cluster: &ClusterConfig{
+			BrokerID: 2,
+			Partitions: map[string]map[int]PartitionAssignment{
+				"demo": {0: {Leader: 1, Replicas: []int{1, 2}}},
+			},
+		},
+	}
+	b := NewBroker(cfg)
+	defer func() { _ = b.Close() }()
+	partPath := filepath.Join(dir, "topic=demo-part=0")
+	if err := b.EnsurePartition("demo", 0, partPath, 64); err != nil {
+		t.Fatalf("ensure partition: %v", err)
+	}
+	if err := b.SetPartitionLeader("demo", 0, 2, 4); err != nil {
+		t.Fatalf("set leader: %v", err)
+	}
+	assign, err := b.PartitionAssignment("demo", 0)
+	if err != nil {
+		t.Fatalf("assignment: %v", err)
+	}
+	if assign.Leader != 2 || assign.Epoch != 4 {
+		t.Fatalf("unexpected assignment %+v", assign)
+	}
+}
+
+func TestBrokerPromotePartitionLeader(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		Cluster: &ClusterConfig{
+			BrokerID: 2,
+			Partitions: map[string]map[int]PartitionAssignment{
+				"demo": {0: {Leader: 1, Replicas: []int{1, 2}}},
+			},
+		},
+	}
+	b := NewBroker(cfg)
+	defer func() { _ = b.Close() }()
+	partPath := filepath.Join(dir, "topic=demo-part=0")
+	if err := b.EnsurePartition("demo", 0, partPath, 64); err != nil {
+		t.Fatalf("ensure partition: %v", err)
+	}
+	if err := b.promotePartitionLeader("demo", 0); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	assign, err := b.PartitionAssignment("demo", 0)
+	if err != nil {
+		t.Fatalf("assignment: %v", err)
+	}
+	if assign.Leader != 2 || assign.Epoch == 0 {
+		t.Fatalf("expected leader 2 with epoch > 0, got %+v", assign)
 	}
 }

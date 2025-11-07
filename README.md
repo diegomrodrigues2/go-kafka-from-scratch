@@ -1,6 +1,6 @@
 # Go Kafka From Scratch
 
-A simplified Kafka-like message broker implementation in Go, demonstrating core distributed log concepts—append-only logs, offset-based consumption, segment-based storage—and now single-leader replication with follower catch-up.
+A simplified Kafka-like message broker implementation in Go, demonstrating core distributed log concepts—append-only logs, offset-based consumption, segment-based storage—and now multiple replication styles (single-leader, multi-leader fan-out and leaderless quorums with hinted handoff/read-repair).
 
 ## Architecture Overview
 
@@ -61,13 +61,20 @@ HTTP REST API exposing broker operations and enforcing consistency hints (for ex
 ```
 POST   /topics/{topic}/partitions/{p}           ? Publish message
 GET    /topics/{topic}/partitions/{p}/fetch     ? Fetch messages (?minOffset= / X-Read-Min-Offset supported)
+GET    /cluster/topics/{topic}/partitions/{p}   ? Cluster metadata (leader, epoch, replicas)
+POST   /cluster/topics/{topic}/partitions/{p}/leader
+                                                ? Leader failover announcement (epoch fencing)
+POST   /cluster/topics/{topic}/partitions/{p}/replica
+                                                ? Leaderless replica ingest (fan-out, hinted handoff, read repair)
 ```
 
 ### 4. Client Libraries (`pkg/client/`)
 High-level APIs for producers and consumers, plus session helpers that remember per-topic offsets to deliver read-your-writes and monotonic reads across replicas.
 
-### 5. Replication (`internal/broker/replication.go`)
-Background worker that keeps follower replicas in sync by polling the leader via the HTTP fetch API and appending records locally using the existing logstore.
+### 5. Replication (`internal/broker/replication.go`, `internal/broker/leaderless.go`)
+Follower brokers stay up to date through a pull-based worker that streams batches from the current leader via HTTP and appends locally. `ClusterConfig` exposes `ReplicaFetchInterval`, `ReplicaRetryInterval` and `FailoverTimeout` to tune replication cadence, retry backoff and the heartbeat window that must elapse before triggering an automatic leader promotion.
+
+For Dynamo/Cassandra-style deployments you can opt into `ReplicationModeLeaderless`. In that mode the broker that receives a client request fans the write out to each replica in parallel, waits for a configurable quorum (`LeaderlessWriteQuorum`, default **2**) and records hints for any failed replicas so it can replay them later. Reads follow the same playbook: the coordinator issues fetches to multiple replicas (`LeaderlessReadQuorum`, default **2**), merges the superset, performs local read-repair by appending missing entries to its own log, then asynchronously repairs any lagging peers (or hands off hints if they are unreachable). A background goroutine drains the hinted handoff queue at `HintDeliveryInterval`.
 
 ## Data Flow Diagrams
 
@@ -116,6 +123,49 @@ sequenceDiagram
         R->>R: advance next offset
     end
 ```
+
+### Leader Failover & Replica Recovery
+
+- **Heartbeat via replication fetches** – followers talk to the leader every `ReplicaFetchInterval`. Consecutive fetch failures beyond the configurable `FailoverTimeout` are treated as a missing heartbeat.
+- **Priority-based promotion** – the replica ordering in `ClusterConfig.Partitions` acts as the failover policy. When a leader disappears, the next broker in that list promotes itself, increments the leader epoch, and starts accepting writes.
+- **Leader epochs & fencing** – promotions bump an epoch counter that is broadcast via `POST /cluster/topics/{topic}/partitions/{p}/leader`. Any broker that restarts fetches the metadata via `GET /cluster/topics/{topic}/partitions/{p}` and refuses writes if its epoch is stale, preventing dual leaders.
+- **Automatic catch-up** – `EnsurePartition` now refreshes metadata before spinning followers. When a broker rejoins, it immediately knows the current leader and starts replicating from the last local offset until it reaches the leader’s `EndOffset`.
+- **Best-effort announcements** – leader changes are pushed to peers, but lagging brokers can still reconcile by explicitly fetching metadata, so clusters remain consistent even if multiple nodes restart simultaneously.
+
+#### Cluster configuration snippet
+
+```go
+cluster := &broker.ClusterConfig{
+    BrokerID: 2,
+    Peers: map[int]string{
+        1: "http://leader:8080",
+        2: "http://follower-a:8081",
+        3: "http://follower-b:8082",
+    },
+    Partitions: map[string]map[int]broker.PartitionAssignment{
+        "demo": {
+            0: {
+                Leader:   1,
+                Replicas: []int{1, 2, 3}, // priority order for failover
+            },
+        },
+    },
+    ReplicaFetchInterval: 100 * time.Millisecond,
+    ReplicaRetryInterval: 500 * time.Millisecond,
+    FailoverTimeout:      2 * time.Second,
+}
+```
+
+Each broker loads the same `ClusterConfig`, changing only `BrokerID` and its `DATA_DIR`. The follower replicators use the fetch/retry intervals to control copy cadence, while `FailoverTimeout` defines how long a leader can remain silent before the next replica assumes control.
+
+#### Manual failover walkthrough
+
+1. Start broker **1** (leader) and broker **2** (follower) with the configuration above.
+2. Publish a few records to broker **1** (`POST /topics/demo/partitions/0`).
+3. Stop broker **1** or block its network port. Broker **2** notices the missing heartbeat after `FailoverTimeout` and logs a promotion message (`promoted to leader... epoch=N`).
+4. Publish more records through broker **2**. Clients previously pointing at broker **1** will receive HTTP 307 responses directing them to the new leader.
+5. Restart broker **1**. On boot it calls `GET /cluster/topics/demo/partitions/0`, notices it has a stale epoch, flips into follower mode, and catches up by replaying the leader’s log through the replication loop.
+6. (Optional) Bring broker **2** down again to confirm broker **1** promotes itself back once it becomes the highest-priority replica.
 
 ### Message Consumption Flow
 
@@ -328,6 +378,64 @@ _ = follower.EnsurePartition("demo", 0, "./data/topic=demo-part=0", 128<<20)
 
 Once configured, the follower will continuously poll the leader’s fetch endpoint and mirror the log locally. Writes issued to a follower via the HTTP API are rejected with a redirect to the leader.
 
+### Multi-Leader Mode
+
+For geo-distributed or occasionally disconnected deployments you can switch a partition into multi-leader replication by setting `ReplicationMode: broker.ReplicationModeMulti`. In this mode every replica listed in the assignment is treated as a writable leader. Each broker streams raw log entries from every other replica, deduplicating them by origin/sequence metadata so that events are applied exactly once even if they travel through intermediate peers.
+
+```go
+cluster := &broker.ClusterConfig{
+    BrokerID:        1,
+    Peers: map[int]string{
+        1: "http://dc1:8080",
+        2: "http://dc2:8080",
+    },
+    Partitions: map[string]map[int]broker.PartitionAssignment{
+        "demo": {
+            0: {Leader: 1, Replicas: []int{1, 2}},
+        },
+    },
+    ReplicationMode:      broker.ReplicationModeMulti,
+    ReplicaFetchInterval: 100 * time.Millisecond,
+}
+node := broker.NewBroker(broker.Config{Cluster: cluster})
+_ = node.EnsurePartition("demo", 0, "./data/topic=demo-part=0", 128<<20)
+```
+
+Clients can now publish to either replica and the background peer replicators will exchange updates bidirectionally. Because every node keeps its own offset space, ordering may diverge slightly between replicas; consumers should stick to a single broker per partition if they require monotonic reads.
+
+### Leaderless Quorum Mode
+
+Leaderless replication trades strict ordering for higher availability by letting any replica coordinate writes. Set `ReplicationMode: broker.ReplicationModeLeaderless` and provide a replica set (recommended `N=3`). When a broker receives a `POST /topics/{topic}/partitions/{p}` it:
+
+1. Appends locally (assigning its origin/sequence metadata).
+2. Issues parallel `POST /cluster/topics/{topic}/partitions/{p}/replica` calls to the remaining replicas, awaiting at least `LeaderlessWriteQuorum` acknowledgements (`W`) before replying to the client.
+3. Stores hinted-handoff entries for replicas that timed out or were offline so they can be replayed once connectivity returns.
+
+A read uses the same fan-out pattern with `LeaderlessReadQuorum` (`R`). The coordinator asks each replica for `raw=1` fetches, merges the superset (deduplicating by origin id/sequence), appends any missing entries to itself, and asynchronously repairs lagging peers (or just drops more hints). Configure `R + W > N` (the default 2/2/3 satisfies this) to guarantee that reads intersect the quorum that accepted the most recent successful write.
+
+```go
+cluster := &broker.ClusterConfig{
+    BrokerID:              1,
+    ReplicationMode:       broker.ReplicationModeLeaderless,
+    LeaderlessWriteQuorum: 2,
+    LeaderlessReadQuorum:  2,
+    Peers: map[int]string{
+        1: "http://broker1:8080",
+        2: "http://broker2:8080",
+        3: "http://broker3:8080",
+    },
+    Partitions: map[string]map[int]broker.PartitionAssignment{
+        "demo": {
+            0: {Replicas: []int{1, 2, 3}},
+        },
+    },
+}
+node := broker.NewBroker(broker.Config{Cluster: cluster})
+_ = node.EnsurePartition("demo", 0, "./data/topic=demo-part=0", 128<<20)
+```
+
+Because every replica can coordinate both reads and writes, clients can hit whichever broker is reachable without first discovering a leader. Quorum failures surface as HTTP 503 so callers can retry or downgrade their consistency level if desired.
+
 ## Design Decisions
 
 ### Strengths
@@ -335,14 +443,15 @@ Once configured, the follower will continuously poll the leader’s fetch endpoi
 - Clean separation of concerns
 - Excellent testability (100% test coverage)
 - Segment-based storage (scalable)
-- Asynchronous single-leader replication for higher availability
+- Asynchronous single-leader replication plus optional multi-leader and leaderless quorum modes
+- Hinted handoff and read-repair close the eventual-consistency gap automatically
 - Optional client sessions offer read-your-writes and monotonic reads
 - Standard Go project layout
 
 ### Limitations
 - Static cluster assignments (no controller or dynamic rebalancing)
-- No automatic leader failover or election
-- Client-managed consistency (sessions must steer reads to suitable replicas)
+- Leader election relies on static replica priority (no quorum/majority safety)
+- Client-managed consistency (sessions must steer reads to suitable replicas and choose quorum knobs)
 - No consumer groups or offset commits
 - No retention policies or compaction
 - No authentication/authorization
