@@ -121,3 +121,30 @@ func TestConsumerFetchRequestError(t *testing.T) {
 		t.Fatalf("expected request error")
 	}
 }
+
+func TestConsumerFetchWithMetadata(t *testing.T) {
+	commitVersion := uint64(5)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"fromOffset":     10,
+			"toOffset":       12,
+			"records":        [][]byte{[]byte("x")},
+			"commitVersions": []*uint64{&commitVersion},
+			"deltaVersion":   uint64(6),
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := Consumer{BaseURL: srv.URL}
+	res, err := c.FetchWithMetadata("topic", 0, 10, 0)
+	if err != nil {
+		t.Fatalf("fetch metadata: %v", err)
+	}
+	if res.DeltaVersion == nil || *res.DeltaVersion != 6 {
+		t.Fatalf("unexpected delta version %v", res.DeltaVersion)
+	}
+	if len(res.CommitVersions) != 1 || res.CommitVersions[0] == nil || *res.CommitVersions[0] != 5 {
+		t.Fatalf("unexpected commit versions %v", res.CommitVersions)
+	}
+}

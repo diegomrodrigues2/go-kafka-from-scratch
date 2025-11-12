@@ -103,7 +103,7 @@ func (fr *followerReplicator) run() {
 		default:
 		}
 
-		records, lastOffset, err := fr.fetch(offset)
+		records, versions, lastOffset, err := fr.fetch(offset)
 		if err != nil {
 			log.Printf("follower replicate topic=%s partition=%d fetch error: %v", fr.topic, fr.partition, err)
 			if fr.failoverTimeout > 0 && time.Since(lastSuccess) >= fr.failoverTimeout {
@@ -127,8 +127,14 @@ func (fr *followerReplicator) run() {
 
 		nextOffset := offset
 		appendErr := false
-		for _, rec := range records {
-			appendedOffset, appended, err := fr.part.appendReplica(rec)
+		for idx, rec := range records {
+			var version uint64
+			hasVersion := false
+			if idx < len(versions) && versions[idx] != nil {
+				version = *versions[idx]
+				hasVersion = true
+			}
+			appendedOffset, appended, err := fr.part.appendReplica(rec, version, hasVersion)
 			if err != nil {
 				log.Printf("follower replicate topic=%s partition=%d append error: %v", fr.topic, fr.partition, err)
 				appendErr = true
@@ -184,7 +190,7 @@ func (fr *followerReplicator) triggerPromotion(cause error) bool {
 
 // fetch retrieves records from the leader starting at the supplied offset and
 // returns the payload alongside the highest offset fetched.
-func (fr *followerReplicator) fetch(offset uint64) ([][]byte, uint64, error) {
+func (fr *followerReplicator) fetch(offset uint64) ([][]byte, []*uint64, uint64, error) {
 	return fetchPartitionBatch(fr.client, fr.leaderAddr, fr.topic, fr.partition, offset)
 }
 
@@ -257,7 +263,7 @@ func (pr *peerReplicator) run() {
 		default:
 		}
 
-		records, lastOffset, err := fetchPartitionBatch(pr.client, pr.peerAddr, pr.topic, pr.partition, offset)
+		records, versions, lastOffset, err := fetchPartitionBatch(pr.client, pr.peerAddr, pr.topic, pr.partition, offset)
 		if err != nil {
 			log.Printf("peer replicate topic=%s partition=%d peer=%d fetch error: %v", pr.topic, pr.partition, pr.peerID, err)
 			if !pr.wait(pr.retryInterval) {
@@ -277,8 +283,14 @@ func (pr *peerReplicator) run() {
 		}
 
 		appendErr := false
-		for _, rec := range records {
-			if _, _, err := pr.part.appendReplica(rec); err != nil {
+		for idx, rec := range records {
+			var version uint64
+			hasVersion := false
+			if idx < len(versions) && versions[idx] != nil {
+				version = *versions[idx]
+				hasVersion = true
+			}
+			if _, _, err := pr.part.appendReplica(rec, version, hasVersion); err != nil {
 				log.Printf("peer replicate topic=%s partition=%d peer=%d append error: %v", pr.topic, pr.partition, pr.peerID, err)
 				appendErr = true
 				break
@@ -310,27 +322,28 @@ func (pr *peerReplicator) wait(delay time.Duration) bool {
 	}
 }
 
-func fetchPartitionBatch(client *http.Client, baseAddr, topic string, partition int, offset uint64) ([][]byte, uint64, error) {
+func fetchPartitionBatch(client *http.Client, baseAddr, topic string, partition int, offset uint64) ([][]byte, []*uint64, uint64, error) {
 	urlStr, err := buildReplicaFetchURL(baseAddr, topic, partition, offset)
 	if err != nil {
-		return nil, offset, err
+		return nil, nil, offset, err
 	}
 	resp, err := client.Get(urlStr)
 	if err != nil {
-		return nil, offset, err
+		return nil, nil, offset, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, offset, fmt.Errorf("fetch from peer returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, nil, offset, fmt.Errorf("fetch from peer returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var payload struct {
-		ToOffset   uint64   `json:"toOffset"`
-		Records    []string `json:"records"`
-		RawRecords []string `json:"rawRecords"`
+		ToOffset       uint64    `json:"toOffset"`
+		Records        []string  `json:"records"`
+		RawRecords     []string  `json:"rawRecords"`
+		CommitVersions []*uint64 `json:"commitVersions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, offset, err
+		return nil, nil, offset, err
 	}
 	var result [][]byte
 	if len(payload.RawRecords) > 0 {
@@ -338,7 +351,7 @@ func fetchPartitionBatch(client *http.Client, baseAddr, topic string, partition 
 		for i, raw := range payload.RawRecords {
 			val, err := base64.StdEncoding.DecodeString(raw)
 			if err != nil {
-				return nil, offset, err
+				return nil, nil, offset, err
 			}
 			result[i] = val
 		}
@@ -348,7 +361,7 @@ func fetchPartitionBatch(client *http.Client, baseAddr, topic string, partition 
 			result[i] = []byte(rec)
 		}
 	}
-	return result, payload.ToOffset, nil
+	return result, payload.CommitVersions, payload.ToOffset, nil
 }
 
 func buildReplicaFetchURL(baseAddr, topic string, partition int, offset uint64) (string, error) {

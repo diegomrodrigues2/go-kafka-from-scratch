@@ -17,6 +17,21 @@ type Segment struct {
 	index      *indexFile
 	maxBytes   int64
 	size       int64
+	logPath    string
+	indexPath  string
+}
+
+type appendResult struct {
+	offset      uint64
+	position    int64
+	bytes       int64
+	segmentName string
+}
+
+type segmentSnapshot struct {
+	nextOffset uint64
+	size       int64
+	indexLen   int
 }
 
 func newSegment(dir string, baseOffset uint64, maxBytes int64) (*Segment, error) {
@@ -56,41 +71,53 @@ func newSegment(dir string, baseOffset uint64, maxBytes int64) (*Segment, error)
 		index:      idx,
 		maxBytes:   maxBytes,
 		size:       stat.Size(),
+		logPath:    logPath,
+		indexPath:  idxPath,
 	}
 
 	return seg, nil
 }
 
 func (s *Segment) Append(value []byte) (uint64, error) {
+	res, err := s.appendValue(value)
+	return res.offset, err
+}
+
+func (s *Segment) appendValue(value []byte) (appendResult, error) {
 	recordSize := recordHeaderSize + len(value)
 	if s.size+int64(recordSize) > s.maxBytes {
-		return 0, ErrSegmentFull
+		return appendResult{}, ErrSegmentFull
 	}
 
 	off := s.nextOffset
 
 	pos, err := seekOp(s.store, 0, io.SeekEnd)
 	if err != nil {
-		return 0, err
+		return appendResult{}, err
 	}
 
 	header := make([]byte, recordHeaderSize)
 	putRecordSize(header, len(value))
 	if _, err := writeOp(s.store, header); err != nil {
-		return 0, err
+		return appendResult{}, err
 	}
 	if _, err := writeOp(s.store, value); err != nil {
-		return 0, err
+		return appendResult{}, err
 	}
 
 	rel := uint32(off - s.baseOffset)
 	if err := s.index.add(rel, uint32(pos)); err != nil {
-		return 0, err
+		return appendResult{}, err
 	}
 
 	s.size += int64(recordSize)
 	s.nextOffset++
-	return off, nil
+	return appendResult{
+		offset:      off,
+		position:    pos,
+		bytes:       int64(recordSize),
+		segmentName: filepath.Base(s.logPath),
+	}, nil
 }
 
 func (s *Segment) ReadFrom(offset uint64, maxBytes int) ([][]byte, uint64, int, error) {
@@ -179,4 +206,75 @@ func (s *Segment) BaseOffset() uint64 {
 
 func (s *Segment) Remaining() int64 {
 	return s.maxBytes - s.size
+}
+
+func (s *Segment) truncateEntries(entries int) error {
+	if entries < 0 || entries > s.index.len() {
+		return fmt.Errorf("truncate entries out of range: %d", entries)
+	}
+	if entries == s.index.len() {
+		return nil
+	}
+	var newSize int64
+	if entries == 0 {
+		newSize = 0
+	} else {
+		entry, ok := s.index.entryAt(entries - 1)
+		if !ok {
+			return fmt.Errorf("missing index entry at %d", entries-1)
+		}
+		header := make([]byte, recordHeaderSize)
+		pos := int64(entry.Position)
+		if _, err := readAtOp(s.store, header, pos); err != nil {
+			return err
+		}
+		size := readRecordSize(header)
+		newSize = pos + int64(recordHeaderSize+size)
+	}
+	if err := truncateOp(s.store, newSize); err != nil {
+		return err
+	}
+	if err := s.index.truncate(entries); err != nil {
+		return err
+	}
+	s.size = newSize
+	s.nextOffset = s.baseOffset + uint64(entries)
+	return nil
+}
+
+func (s *Segment) snapshot() segmentSnapshot {
+	return segmentSnapshot{
+		nextOffset: s.nextOffset,
+		size:       s.size,
+		indexLen:   s.index.len(),
+	}
+}
+
+func (s *Segment) restore(snapshot segmentSnapshot) error {
+	if err := truncateOp(s.store, snapshot.size); err != nil {
+		return err
+	}
+	if err := s.index.truncate(snapshot.indexLen); err != nil {
+		return err
+	}
+	s.size = snapshot.size
+	s.nextOffset = snapshot.nextOffset
+	return nil
+}
+
+func (s *Segment) FileName() string {
+	return filepath.Base(s.logPath)
+}
+
+func (s *Segment) deleteFiles() error {
+	if err := s.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(s.logPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(s.indexPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }

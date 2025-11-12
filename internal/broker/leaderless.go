@@ -18,9 +18,11 @@ import (
 )
 
 type hintEntry struct {
-	topic     string
-	partition int
-	raw       []byte
+	topic      string
+	partition  int
+	raw        []byte
+	version    uint64
+	hasVersion bool
 }
 
 type hintStore struct {
@@ -79,11 +81,13 @@ func (b *Broker) publishLeaderless(topic string, partition int, value []byte) (u
 	if err != nil {
 		return 0, err
 	}
-	offset, seq, err := pl.appendLocal(brokerID, value)
+	offset, seq, version, err := pl.appendLocal(brokerID, value)
 	if err != nil {
 		return 0, err
 	}
 	raw := encodeRecord(brokerID, seq, value)
+	versionCopy := version
+	replicaVersions := []*uint64{&versionCopy}
 
 	total := len(assign.Replicas)
 	if total == 0 {
@@ -106,7 +110,7 @@ func (b *Broker) publishLeaderless(topic string, partition int, value []byte) (u
 		addr := b.peerAddress(peerID)
 		if addr == "" {
 			errs = append(errs, fmt.Errorf("peer %d address unavailable", peerID))
-			b.enqueueHint(peerID, topic, partition, raw)
+			b.enqueueHint(peerID, topic, partition, raw, version, true)
 			continue
 		}
 		targets = append(targets, struct {
@@ -126,7 +130,7 @@ func (b *Broker) publishLeaderless(topic string, partition int, value []byte) (u
 				id   int
 				addr string
 			}) {
-				err := b.sendReplicaRecords(target.addr, topic, partition, [][]byte{raw})
+				err := b.sendReplicaRecords(target.addr, topic, partition, [][]byte{raw}, replicaVersions)
 				results <- writeResult{id: target.id, err: err}
 			}(tgt)
 		}
@@ -137,7 +141,7 @@ func (b *Broker) publishLeaderless(topic string, partition int, value []byte) (u
 				continue
 			}
 			errs = append(errs, fmt.Errorf("peer %d: %w", res.id, res.err))
-			b.enqueueHint(res.id, topic, partition, raw)
+			b.enqueueHint(res.id, topic, partition, raw, version, true)
 		}
 	}
 
@@ -154,23 +158,25 @@ func (b *Broker) publishLeaderless(topic string, partition int, value []byte) (u
 }
 
 // enqueueHint stores a hinted handoff entry and wakes the delivery loop.
-func (b *Broker) enqueueHint(dest int, topic string, partition int, raw []byte) {
-	b.enqueueHintInternal(dest, topic, partition, raw, true)
+func (b *Broker) enqueueHint(dest int, topic string, partition int, raw []byte, version uint64, hasVersion bool) {
+	b.enqueueHintInternal(dest, topic, partition, raw, version, hasVersion, true)
 }
 
 // enqueueHintNoWake stores a hint without signalling the worker (used while already flushing).
-func (b *Broker) enqueueHintNoWake(dest int, topic string, partition int, raw []byte) {
-	b.enqueueHintInternal(dest, topic, partition, raw, false)
+func (b *Broker) enqueueHintNoWake(dest int, topic string, partition int, raw []byte, version uint64, hasVersion bool) {
+	b.enqueueHintInternal(dest, topic, partition, raw, version, hasVersion, false)
 }
 
 // enqueueHintInternal centralises hint creation so both public helpers share the same logic.
-func (b *Broker) enqueueHintInternal(dest int, topic string, partition int, raw []byte, wake bool) {
+func (b *Broker) enqueueHintInternal(dest int, topic string, partition int, raw []byte, version uint64, hasVersion bool, wake bool) {
 	if dest == 0 || b.hintStore == nil {
 		return
 	}
 	entry := hintEntry{
-		topic:     topic,
-		partition: partition,
+		topic:      topic,
+		partition:  partition,
+		version:    version,
+		hasVersion: hasVersion,
 	}
 	if raw != nil {
 		entry.raw = append([]byte(nil), raw...)
@@ -190,7 +196,7 @@ func (b *Broker) peerAddress(peerID int) string {
 }
 
 // sendReplicaRecords pushes raw records into the peer replica ingest endpoint using the broker HTTP client.
-func (b *Broker) sendReplicaRecords(addr, topic string, partition int, records [][]byte) error {
+func (b *Broker) sendReplicaRecords(addr, topic string, partition int, records [][]byte, versions []*uint64) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -203,9 +209,11 @@ func (b *Broker) sendReplicaRecords(addr, topic string, partition int, records [
 		return err
 	}
 	payload := struct {
-		Records []string `json:"records"`
+		Records  []string  `json:"records"`
+		Versions []*uint64 `json:"versions,omitempty"`
 	}{
-		Records: make([]string, len(records)),
+		Records:  make([]string, len(records)),
+		Versions: versions,
 	}
 	for i, raw := range records {
 		payload.Records[i] = base64.StdEncoding.EncodeToString(raw)
@@ -302,14 +310,19 @@ func (b *Broker) flushHints() {
 		addr := b.peerAddress(peerID)
 		if addr == "" {
 			for _, entry := range entries {
-				b.enqueueHintNoWake(peerID, entry.topic, entry.partition, entry.raw)
+				b.enqueueHintNoWake(peerID, entry.topic, entry.partition, entry.raw, entry.version, entry.hasVersion)
 			}
 			continue
 		}
 		for _, entry := range entries {
-			if err := b.sendReplicaRecords(addr, entry.topic, entry.partition, [][]byte{entry.raw}); err != nil {
+			var versions []*uint64
+			if entry.hasVersion {
+				version := entry.version
+				versions = []*uint64{&version}
+			}
+			if err := b.sendReplicaRecords(addr, entry.topic, entry.partition, [][]byte{entry.raw}, versions); err != nil {
 				log.Printf("hint delivery peer=%d topic=%s partition=%d failed: %v", peerID, entry.topic, entry.partition, err)
-				b.enqueueHint(peerID, entry.topic, entry.partition, entry.raw)
+				b.enqueueHint(peerID, entry.topic, entry.partition, entry.raw, entry.version, entry.hasVersion)
 			}
 		}
 	}
@@ -317,12 +330,12 @@ func (b *Broker) flushHints() {
 
 // AppendReplica stores the provided raw record for the given partition,
 // returning whether it was appended (true) or discarded as a duplicate.
-func (b *Broker) AppendReplica(topic string, partition int, raw []byte) (uint64, bool, error) {
+func (b *Broker) AppendReplica(topic string, partition int, raw []byte, version uint64, hasVersion bool) (uint64, bool, error) {
 	pl, err := b.getPartition(topic, partition)
 	if err != nil {
 		return 0, false, err
 	}
-	return pl.appendReplica(raw)
+	return pl.appendReplica(raw, version, hasVersion)
 }
 
 // fetchLeaderless issues a quorum read to peers, merges the superset of records and triggers repairs when needed.
@@ -425,7 +438,13 @@ func (b *Broker) fetchLeaderless(topic string, partition int, offset uint64, max
 		if _, present := localKeys[key]; present {
 			continue
 		}
-		if _, appended, appendErr := pl.appendReplica(rec.Raw); appendErr != nil {
+		var version uint64
+		hasVersion := false
+		if rec.CommitVersion > 0 {
+			version = rec.CommitVersion
+			hasVersion = true
+		}
+		if _, appended, appendErr := pl.appendReplica(rec.Raw, version, hasVersion); appendErr != nil {
 			log.Printf("leaderless read repair append topic=%s partition=%d failed: %v", topic, partition, appendErr)
 			continue
 		} else if appended {
@@ -456,6 +475,7 @@ func (b *Broker) dispatchReadRepairs(topic string, partition int, localID int, n
 			continue
 		}
 		var missing [][]byte
+		var versionPtrs []*uint64
 		for key, rec := range union {
 			if keys != nil {
 				if _, ok := keys[key]; ok {
@@ -463,25 +483,45 @@ func (b *Broker) dispatchReadRepairs(topic string, partition int, localID int, n
 				}
 			}
 			missing = append(missing, append([]byte(nil), rec.Raw...))
+			if rec.CommitVersion > 0 {
+				version := rec.CommitVersion
+				versionPtrs = append(versionPtrs, &version)
+			} else {
+				versionPtrs = append(versionPtrs, nil)
+			}
 		}
 		if len(missing) == 0 {
 			continue
 		}
 		addr := b.peerAddress(peerID)
 		if addr == "" {
-			for _, raw := range missing {
-				b.enqueueHintNoWake(peerID, topic, partition, raw)
+			for idx, raw := range missing {
+				var version uint64
+				hasVersion := false
+				if idx < len(versionPtrs) && versionPtrs[idx] != nil {
+					version = *versionPtrs[idx]
+					hasVersion = true
+				}
+				b.enqueueHintNoWake(peerID, topic, partition, raw, version, hasVersion)
 			}
 			continue
 		}
-		go func(id int, target string, payload [][]byte) {
-			if err := b.sendReplicaRecords(target, topic, partition, payload); err != nil {
+		versionsCopy := make([]*uint64, len(versionPtrs))
+		copy(versionsCopy, versionPtrs)
+		go func(id int, target string, payload [][]byte, versions []*uint64) {
+			if err := b.sendReplicaRecords(target, topic, partition, payload, versions); err != nil {
 				log.Printf("leaderless read repair peer=%d topic=%s partition=%d failed: %v", id, topic, partition, err)
-				for _, raw := range payload {
-					b.enqueueHint(id, topic, partition, raw)
+				for idx, raw := range payload {
+					var version uint64
+					hasVersion := false
+					if idx < len(versions) && versions[idx] != nil {
+						version = *versions[idx]
+						hasVersion = true
+					}
+					b.enqueueHint(id, topic, partition, raw, version, hasVersion)
 				}
 			}
-		}(peerID, addr, missing)
+		}(peerID, addr, missing, versionsCopy)
 	}
 }
 
@@ -505,9 +545,10 @@ func (b *Broker) fetchReplicaRecords(addr, topic string, partition int, offset u
 		return nil, offset, fmt.Errorf("fetch from peer returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var payload struct {
-		ToOffset   uint64   `json:"toOffset"`
-		Records    []string `json:"records"`
-		RawRecords []string `json:"rawRecords"`
+		ToOffset       uint64    `json:"toOffset"`
+		Records        []string  `json:"records"`
+		RawRecords     []string  `json:"rawRecords"`
+		CommitVersions []*uint64 `json:"commitVersions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, offset, err
@@ -528,7 +569,11 @@ func (b *Broker) fetchReplicaRecords(addr, topic string, partition int, offset u
 	}
 	out := make([]PartitionRecord, len(rawList))
 	for i, raw := range rawList {
-		out[i] = decodeRecord(raw)
+		rec := decodeRecord(raw)
+		if i < len(payload.CommitVersions) && payload.CommitVersions[i] != nil {
+			rec.CommitVersion = *payload.CommitVersions[i]
+		}
+		out[i] = rec
 	}
 	return out, payload.ToOffset, nil
 }

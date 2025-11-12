@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/api"
 	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/broker"
@@ -31,7 +32,9 @@ func run() error {
 	topic := getenv("TOPIC", "demo")
 	partition := 0
 
-	b := broker.NewBroker()
+	cfg := broker.DefaultConfig()
+	cfg.EnableTransactions = getenvBool("ENABLE_TRANSACTIONS", true)
+	b := broker.NewBroker(cfg)
 	defer func() { _ = b.Close() }()
 	if err := mkdirAll(dataDir, 0o755); err != nil {
 		return err
@@ -55,4 +58,19 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func getenvBool(k string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }

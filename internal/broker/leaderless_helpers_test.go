@@ -40,7 +40,7 @@ func TestLeaderlessHintEnqueueHelpers(t *testing.T) {
 		hintStore:  newHintStore(),
 		hintWakeCh: make(chan struct{}, 1),
 	}
-	b.enqueueHint(2, "demo", 0, []byte("value"))
+	b.enqueueHint(2, "demo", 0, []byte("value"), 0, false)
 	select {
 	case <-b.hintWakeCh:
 	default:
@@ -50,7 +50,7 @@ func TestLeaderlessHintEnqueueHelpers(t *testing.T) {
 		t.Fatalf("expected pending entry for replica 2, got %v", b.hintStore.pending)
 	}
 
-	b.enqueueHintNoWake(3, "demo", 0, []byte("lazy"))
+	b.enqueueHintNoWake(3, "demo", 0, []byte("lazy"), 0, false)
 	select {
 	case <-b.hintWakeCh:
 		t.Fatalf("enqueueHintNoWake must not wake hint loop")
@@ -80,10 +80,10 @@ func TestBrokerPeerAddress(t *testing.T) {
 
 func TestSendReplicaRecordsScenarios(t *testing.T) {
 	b := &Broker{}
-	if err := b.sendReplicaRecords("addr", "demo", 0, nil); err != nil {
+	if err := b.sendReplicaRecords("addr", "demo", 0, nil, nil); err != nil {
 		t.Fatalf("unexpected error on empty batch: %v", err)
 	}
-	if err := b.sendReplicaRecords("addr", "demo", 0, [][]byte{{1}}); err == nil {
+	if err := b.sendReplicaRecords("addr", "demo", 0, [][]byte{{1}}, nil); err == nil {
 		t.Fatalf("expected error when http client is nil")
 	}
 
@@ -94,7 +94,7 @@ func TestSendReplicaRecordsScenarios(t *testing.T) {
 	defer failSrv.Close()
 
 	b.httpClient = failSrv.Client()
-	if err := b.sendReplicaRecords(failSrv.URL, "demo", 0, [][]byte{{1}}); err == nil {
+	if err := b.sendReplicaRecords(failSrv.URL, "demo", 0, [][]byte{{1}}, nil); err == nil {
 		t.Fatalf("expected error when peer returns failure")
 	}
 
@@ -115,7 +115,7 @@ func TestSendReplicaRecordsScenarios(t *testing.T) {
 	defer okSrv.Close()
 
 	b.httpClient = okSrv.Client()
-	if err := b.sendReplicaRecords(okSrv.URL, "demo", 0, [][]byte{{2}}); err != nil {
+	if err := b.sendReplicaRecords(okSrv.URL, "demo", 0, [][]byte{{2}}, nil); err != nil {
 		t.Fatalf("unexpected error sending to peer: %v", err)
 	}
 	if len(wrote) != 1 || wrote[0][0] != 2 {
@@ -135,7 +135,7 @@ func TestFlushHintsScenarios(t *testing.T) {
 			2: "",
 		},
 	}
-	b.enqueueHintNoWake(2, "demo", 0, []byte("v1"))
+	b.enqueueHintNoWake(2, "demo", 0, []byte("v1"), 0, false)
 	b.flushHints() // missing address requeues
 	if len(b.hintStore.pending[2]) != 1 {
 		t.Fatalf("expected hint to remain pending when address missing")
@@ -178,7 +178,7 @@ func TestLeaderlessHintLoopLifecycle(t *testing.T) {
 		close(done)
 	}()
 
-	b.enqueueHint(2, "demo", 0, []byte("value"))
+	b.enqueueHint(2, "demo", 0, []byte("value"), 0, false)
 	time.Sleep(10 * time.Millisecond)
 	b.notifyHintLoop()
 	time.Sleep(10 * time.Millisecond)
@@ -209,10 +209,10 @@ func TestAppendReplicaCovers(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = b.Close() })
 	raw := encodeRecord(1, 1, []byte("value"))
-	if off, appended, err := b.AppendReplica("demo", 0, raw); err != nil || !appended || off != 0 {
+	if off, appended, err := b.AppendReplica("demo", 0, raw, 0, false); err != nil || !appended || off != 0 {
 		t.Fatalf("append replica failed: off=%d appended=%v err=%v", off, appended, err)
 	}
-	if _, appended, err := b.AppendReplica("demo", 0, raw); err != nil || appended {
+	if _, appended, err := b.AppendReplica("demo", 0, raw, 0, false); err != nil || appended {
 		t.Fatalf("expected duplicate to be ignored, appended=%v err=%v", appended, err)
 	}
 }
@@ -256,7 +256,7 @@ func TestFetchLeaderlessQuorumAndRepairs(t *testing.T) {
 	}
 
 	// Prepare local record so read-repair has work to do.
-	if _, _, err := pl.appendLocal(1, []byte("local")); err != nil {
+	if _, _, _, err := pl.appendLocal(1, []byte("local")); err != nil {
 		t.Fatalf("append local: %v", err)
 	}
 
@@ -316,7 +316,7 @@ func TestDispatchReadRepairsHintFallback(t *testing.T) {
 	}
 
 	union := map[string]PartitionRecord{
-		"1:1": {HasMeta: true, OriginID: 1, OriginSeq: 1, Raw: encodeRecord(1, 1, []byte("repair"))},
+		"1:1": {HasMeta: true, OriginID: 1, OriginSeq: 1, Raw: encodeRecord(1, 1, []byte("repair")), CommitVersion: 1},
 	}
 	nodeKeys := map[int]map[string]struct{}{
 		2: {},

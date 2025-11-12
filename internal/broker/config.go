@@ -23,9 +23,10 @@ const (
 // Config groups the local broker settings together with optional cluster data.
 // When Cluster is nil the broker behaves as a standalone node.
 type Config struct {
-	DataDir      string
-	SegmentBytes int64
-	Cluster      *ClusterConfig
+	DataDir            string
+	SegmentBytes       int64
+	Cluster            *ClusterConfig
+	EnableTransactions bool
 }
 
 // ClusterConfig tells the broker how it fits into the replicated deployment:
@@ -96,9 +97,10 @@ func (pa PartitionAssignment) PreferredSuccessor(currentLeader int) int {
 // the local filesystem.
 func DefaultConfig() Config {
 	return Config{
-		DataDir:      "./data",
-		SegmentBytes: 128 << 20,
-		Cluster:      nil,
+		DataDir:            "./data",
+		SegmentBytes:       128 << 20,
+		Cluster:            nil,
+		EnableTransactions: true,
 	}
 }
 

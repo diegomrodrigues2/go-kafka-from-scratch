@@ -104,3 +104,17 @@ func (i *indexFile) entryAt(idx int) (indexEntry, bool) {
 func (i *indexFile) len() int {
 	return len(i.entries)
 }
+
+func (i *indexFile) truncate(length int) error {
+	if length < 0 || length > len(i.entries) {
+		return errors.New("invalid index truncate length")
+	}
+	if err := truncateOp(i.file, int64(length*8)); err != nil {
+		return err
+	}
+	i.entries = i.entries[:length]
+	if _, err := seekOp(i.file, 0, io.SeekEnd); err != nil {
+		return err
+	}
+	return nil
+}

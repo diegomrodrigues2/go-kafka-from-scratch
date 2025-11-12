@@ -34,9 +34,10 @@ func TestSessionReadYourWrites(t *testing.T) {
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"fromOffset": 5,
-				"toOffset":   5,
-				"records":    [][]byte{body},
+				"fromOffset":   5,
+				"toOffset":     5,
+				"records":      [][]byte{body},
+				"deltaVersion": uint64(1),
 			})
 		default:
 			http.Error(w, "unsupported", http.StatusMethodNotAllowed)
@@ -47,9 +48,10 @@ func TestSessionReadYourWrites(t *testing.T) {
 	followerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"fromOffset": 0,
-			"toOffset":   0,
-			"records":    [][]byte{},
+			"fromOffset":   0,
+			"toOffset":     0,
+			"records":      [][]byte{},
+			"deltaVersion": uint64(1),
 		})
 	}))
 	t.Cleanup(followerSrv.Close)
@@ -108,9 +110,10 @@ func TestSessionMonotonicReads(t *testing.T) {
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"fromOffset": to,
-				"toOffset":   to,
-				"records":    [][]byte{[]byte("ok")},
+				"fromOffset":   to,
+				"toOffset":     to,
+				"records":      [][]byte{[]byte("ok")},
+				"deltaVersion": uint64(to),
 			})
 		default:
 			http.Error(w, "unsupported", http.StatusMethodNotAllowed)
@@ -129,9 +132,10 @@ func TestSessionMonotonicReads(t *testing.T) {
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"fromOffset": to,
-			"toOffset":   to,
-			"records":    [][]byte{},
+			"fromOffset":   to,
+			"toOffset":     to,
+			"records":      [][]byte{},
+			"deltaVersion": uint64(to),
 		})
 	}))
 	t.Cleanup(followerSrv.Close)
@@ -167,5 +171,73 @@ func TestSessionMonotonicReads(t *testing.T) {
 	}
 	if nextLast < last {
 		t.Fatalf("monotonic read violated: last=%d next=%d", last, nextLast)
+	}
+}
+
+func TestSessionFetchAtLeastVersion(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		followerHeader string
+	)
+
+	leaderSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"fromOffset":   1,
+				"toOffset":     1,
+				"records":      [][]byte{[]byte("leader")},
+				"deltaVersion": uint64(2),
+			})
+		case http.MethodPost:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"offset": 1})
+		default:
+			http.Error(w, "unsupported", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(leaderSrv.Close)
+
+	followerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		followerHeader = r.Header.Get(readMinVersionHeader)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"fromOffset":   1,
+			"toOffset":     1,
+			"records":      [][]byte{[]byte("follower")},
+			"deltaVersion": uint64(2),
+		})
+	}))
+	t.Cleanup(followerSrv.Close)
+
+	session, err := NewSession(SessionConfig{
+		SessionID:    "user-version",
+		LeaderURL:    leaderSrv.URL,
+		FollowerURLs: []string{followerSrv.URL},
+	})
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+
+	if _, err := session.Publish("demo", 0, []byte("payload")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if _, _, err := session.FetchAtLeastVersion("demo", 0, 0, 0, 2); err != nil {
+		t.Fatalf("prime fetch: %v", err)
+	}
+
+	if _, _, err := session.FetchAtLeastVersion("demo", 0, 0, 0, 2); err != nil {
+		t.Fatalf("fetch with version: %v", err)
+	}
+
+	mu.Lock()
+	header := followerHeader
+	mu.Unlock()
+	if header != "2" {
+		t.Fatalf("expected follower to receive min version header 2, got %s", header)
 	}
 }

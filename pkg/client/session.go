@@ -14,7 +14,10 @@ import (
 	"time"
 )
 
-const readMinOffsetHeader = "X-Read-Min-Offset"
+const (
+	readMinOffsetHeader  = "X-Read-Min-Offset"
+	readMinVersionHeader = "X-Read-Min-Version"
+)
 
 // SessionConfig describes how a client session connects to a replicated cluster.
 type SessionConfig struct {
@@ -38,6 +41,7 @@ type Session struct {
 	mu          sync.Mutex
 	lastWritten map[string]uint64
 	lastRead    map[string]uint64
+	lastVersion map[string]uint64
 }
 
 // NewSession creates a new session ensuring the configuration is valid.
@@ -55,6 +59,7 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 		stickyFollower: selectFollower(cfg.SessionID, cfg.FollowerURLs),
 		lastWritten:    make(map[string]uint64),
 		lastRead:       make(map[string]uint64),
+		lastVersion:    make(map[string]uint64),
 	}, nil
 }
 
@@ -118,49 +123,75 @@ func (s *Session) publishWithRedirect(endpoint string, value []byte, depth int) 
 
 // Fetch retrieves records while enforcing read-your-writes and monotonic reads.
 func (s *Session) Fetch(topic string, partition int, offset uint64, maxBytes int) ([][]byte, uint64, error) {
+	return s.fetchInternal(topic, partition, offset, maxBytes, 0)
+}
+
+// FetchAtLeastVersion enforces that the replica has applied at least minVersion commits.
+func (s *Session) FetchAtLeastVersion(topic string, partition int, offset uint64, maxBytes int, minVersion uint64) ([][]byte, uint64, error) {
+	return s.fetchInternal(topic, partition, offset, maxBytes, minVersion)
+}
+
+func (s *Session) fetchInternal(topic string, partition int, offset uint64, maxBytes int, minVersion uint64) ([][]byte, uint64, error) {
 	key := key(topic, partition)
 
 	s.mu.Lock()
 	lastWritten := s.lastWritten[key]
 	lastRead := s.lastRead[key]
+	lastVersion := s.lastVersion[key]
 	s.mu.Unlock()
 
 	requiredOffset := lastRead
 	if lastWritten > requiredOffset {
 		requiredOffset = lastWritten
 	}
+	requiredVersion := lastVersion
+	if minVersion > requiredVersion {
+		requiredVersion = minVersion
+	}
 
-	baseURL := s.selectBaseURL(key, requiredOffset, lastRead)
-	endpoint := composeFetchURL(baseURL, topic, partition, offset, maxBytes, requiredOffset)
+	baseURL := s.selectBaseURL(key, requiredOffset, lastRead, requiredVersion, lastVersion)
+	endpoint := composeFetchURL(baseURL, topic, partition, offset, maxBytes, requiredOffset, requiredVersion)
 
-	records, toOffset, err := s.fetchWithRedirect(endpoint, requiredOffset, 0)
+	resp, err := s.fetchWithRedirect(endpoint, requiredOffset, requiredVersion, 0)
 	if err != nil {
 		return nil, offset, err
 	}
+	records := resp.Records
+	toOffset := resp.ToOffset
 
 	if requiredOffset > 0 && toOffset < requiredOffset && !sameEndpoint(baseURL, s.cfg.LeaderURL) {
-		leaderURL := composeFetchURL(s.cfg.LeaderURL, topic, partition, offset, maxBytes, requiredOffset)
-		records, toOffset, err = s.fetchWithRedirect(leaderURL, requiredOffset, 0)
+		leaderURL := composeFetchURL(s.cfg.LeaderURL, topic, partition, offset, maxBytes, requiredOffset, requiredVersion)
+		resp, err = s.fetchWithRedirect(leaderURL, requiredOffset, requiredVersion, 0)
 		if err != nil {
 			return nil, offset, err
 		}
+		records = resp.Records
+		toOffset = resp.ToOffset
 	}
 
 	if requiredOffset > 0 && toOffset < requiredOffset {
 		return nil, offset, fmt.Errorf("consistency guarantee violated: toOffset=%d required=%d", toOffset, requiredOffset)
+	}
+	if requiredVersion > 0 {
+		if resp.DeltaVersion == nil || *resp.DeltaVersion < requiredVersion {
+			return nil, offset, fmt.Errorf("consistency guarantee violated: version=%v required=%d", resp.DeltaVersion, requiredVersion)
+		}
 	}
 
 	s.mu.Lock()
 	if toOffset > s.lastRead[key] {
 		s.lastRead[key] = toOffset
 	}
+	if resp.DeltaVersion != nil && *resp.DeltaVersion > s.lastVersion[key] {
+		s.lastVersion[key] = *resp.DeltaVersion
+	}
 	s.mu.Unlock()
 
 	return records, toOffset, nil
 }
 
-func (s *Session) selectBaseURL(key string, requiredOffset, lastRead uint64) string {
-	if requiredOffset > lastRead && requiredOffset > 0 {
+func (s *Session) selectBaseURL(key string, requiredOffset, lastRead, requiredVersion, lastVersion uint64) string {
+	if (requiredOffset > lastRead && requiredOffset > 0) || (requiredVersion > lastVersion && requiredVersion > 0) {
 		return s.cfg.LeaderURL
 	}
 	if s.stickyFollower != "" {
@@ -169,28 +200,37 @@ func (s *Session) selectBaseURL(key string, requiredOffset, lastRead uint64) str
 	return s.cfg.LeaderURL
 }
 
-func (s *Session) fetchWithRedirect(endpoint string, minOffset uint64, depth int) ([][]byte, uint64, error) {
+type fetchPayload struct {
+	Records      [][]byte
+	ToOffset     uint64
+	DeltaVersion *uint64
+}
+
+func (s *Session) fetchWithRedirect(endpoint string, minOffset, minVersion uint64, depth int) (fetchPayload, error) {
 	if depth > 5 {
-		return nil, 0, fmt.Errorf("too many redirects")
+		return fetchPayload{}, fmt.Errorf("too many redirects")
 	}
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, 0, err
+		return fetchPayload{}, err
 	}
 	if minOffset > 0 {
 		req.Header.Set(readMinOffsetHeader, strconv.FormatUint(minOffset, 10))
 	}
+	if minVersion > 0 {
+		req.Header.Set(readMinVersionHeader, strconv.FormatUint(minVersion, 10))
+	}
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return fetchPayload{}, err
 	}
 	defer resp.Body.Close()
 
 	if shouldRedirect(resp.StatusCode) {
 		loc, err := resp.Location()
 		if err != nil {
-			return nil, 0, fmt.Errorf("redirect without location")
+			return fetchPayload{}, fmt.Errorf("redirect without location")
 		}
 		next := loc.String()
 		if !loc.IsAbs() {
@@ -199,24 +239,30 @@ func (s *Session) fetchWithRedirect(endpoint string, minOffset uint64, depth int
 				next = base.ResolveReference(loc).String()
 			}
 		}
-		return s.fetchWithRedirect(next, minOffset, depth+1)
+		return s.fetchWithRedirect(next, minOffset, minVersion, depth+1)
 	}
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, 0, fmt.Errorf("fetch failed: %s %s", resp.Status, strings.TrimSpace(string(body)))
+		return fetchPayload{}, fmt.Errorf("fetch failed: %s %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 
 	var out struct {
-		FromOffset uint64   `json:"fromOffset"`
-		ToOffset   uint64   `json:"toOffset"`
-		Records    [][]byte `json:"records"`
+		FromOffset     uint64    `json:"fromOffset"`
+		ToOffset       uint64    `json:"toOffset"`
+		Records        [][]byte  `json:"records"`
+		CommitVersions []*uint64 `json:"commitVersions"`
+		DeltaVersion   *uint64   `json:"deltaVersion"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, 0, err
+		return fetchPayload{}, err
 	}
 
-	return out.Records, out.ToOffset, nil
+	return fetchPayload{
+		Records:      out.Records,
+		ToOffset:     out.ToOffset,
+		DeltaVersion: out.DeltaVersion,
+	}, nil
 }
 
 func shouldRedirect(status int) bool {
@@ -232,7 +278,7 @@ func shouldRedirect(status int) bool {
 	}
 }
 
-func composeFetchURL(baseURL, topic string, partition int, offset uint64, maxBytes int, minOffset uint64) string {
+func composeFetchURL(baseURL, topic string, partition int, offset uint64, maxBytes int, minOffset, minVersion uint64) string {
 	sb := &strings.Builder{}
 	sb.WriteString(fmt.Sprintf("%s/topics/%s/partitions/%d/fetch?offset=%d", baseURL, topic, partition, offset))
 	if maxBytes > 0 {
@@ -242,6 +288,10 @@ func composeFetchURL(baseURL, topic string, partition int, offset uint64, maxByt
 	if minOffset > 0 {
 		sb.WriteString("&minOffset=")
 		sb.WriteString(strconv.FormatUint(minOffset, 10))
+	}
+	if minVersion > 0 {
+		sb.WriteString("&minVersion=")
+		sb.WriteString(strconv.FormatUint(minVersion, 10))
 	}
 	return sb.String()
 }

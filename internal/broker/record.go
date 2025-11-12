@@ -12,11 +12,12 @@ const (
 // PartitionRecord represents a log entry together with the metadata required to
 // deduplicate replicated writes.
 type PartitionRecord struct {
-	Raw       []byte
-	Payload   []byte
-	OriginID  int
-	OriginSeq uint64
-	HasMeta   bool
+	Raw           []byte
+	Payload       []byte
+	OriginID      int
+	OriginSeq     uint64
+	HasMeta       bool
+	CommitVersion uint64
 }
 
 func encodeRecord(originID int, seq uint64, payload []byte) []byte {

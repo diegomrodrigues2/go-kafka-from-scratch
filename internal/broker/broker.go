@@ -2,6 +2,7 @@ package broker
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,23 +15,32 @@ import (
 	"sync"
 	"time"
 
+	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/deltalog"
 	"github.com/diegomrodrigues2/go-kafka-from-scratch/internal/logstore"
 )
 
 var (
-	ErrPartitionNotFound   = errors.New("partition not found")
-	ErrNotLeader           = errors.New("broker is not leader for partition")
-	ErrLeaderNotAvailable  = errors.New("leader not available")
-	ErrStaleLeaderEpoch    = errors.New("stale leader epoch")
-	ErrReplicaNotInSet     = errors.New("broker is not in replica set")
-	ErrPromotionNotAllowed = errors.New("promotion not allowed for this replica")
-	ErrWriteQuorumNotMet   = errors.New("write quorum not satisfied")
-	ErrReadQuorumNotMet    = errors.New("read quorum not satisfied")
+	ErrPartitionNotFound    = errors.New("partition not found")
+	ErrNotLeader            = errors.New("broker is not leader for partition")
+	ErrLeaderNotAvailable   = errors.New("leader not available")
+	ErrStaleLeaderEpoch     = errors.New("stale leader epoch")
+	ErrReplicaNotInSet      = errors.New("broker is not in replica set")
+	ErrPromotionNotAllowed  = errors.New("promotion not allowed for this replica")
+	ErrWriteQuorumNotMet    = errors.New("write quorum not satisfied")
+	ErrReadQuorumNotMet     = errors.New("read quorum not satisfied")
+	ErrTxnConflict          = errors.New("transaction conflict")
+	ErrTransactionsDisabled = errors.New("transactions disabled for partition")
 )
 
 type topicPartition struct {
 	topic     string
 	partition int
+}
+
+// PartitionMetrics captures simple observability data for a partition.
+type PartitionMetrics struct {
+	NextOffset   uint64  `json:"nextOffset"`
+	DeltaVersion *uint64 `json:"deltaVersion,omitempty"`
 }
 
 // Broker owns the local partition logs and optionally coordinates follower
@@ -117,7 +127,11 @@ func (b *Broker) EnsurePartition(topic string, partition int, path string, segme
 	}
 	b.mu.RUnlock()
 
-	lg, err := logstore.Open(logPath, segmentBytes)
+	var logOpts []logstore.Option
+	if b.conf.EnableTransactions {
+		logOpts = append(logOpts, logstore.WithDeltaLog())
+	}
+	lg, err := logstore.Open(logPath, segmentBytes, logOpts...)
 	if err != nil {
 		return err
 	}
@@ -477,8 +491,39 @@ func (b *Broker) Publish(topic string, partition int, key, value []byte) (uint64
 	if b.conf.Cluster != nil {
 		originID = b.conf.Cluster.BrokerID
 	}
-	offset, _, err := pl.appendLocal(originID, value)
+	offset, _, _, err := pl.appendLocal(originID, value)
 	return offset, err
+}
+
+// PublishBatch atomically appends multiple records to the target partition when transactions are enabled.
+func (b *Broker) PublishBatch(topic string, partition int, values [][]byte) ([]uint64, uint64, bool, error) {
+	if len(values) == 0 {
+		return nil, 0, false, errors.New("batch requires at least one record")
+	}
+	if b.leaderlessEnabled() {
+		offsets := make([]uint64, len(values))
+		for i, value := range values {
+			off, err := b.publishLeaderless(topic, partition, value)
+			if err != nil {
+				return nil, 0, false, err
+			}
+			offsets[i] = off
+		}
+		return offsets, 0, false, nil
+	}
+	if err := b.ensureLeader(topic, partition); err != nil {
+		return nil, 0, false, err
+	}
+	pl, err := b.getPartition(topic, partition)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	originID := 0
+	if b.conf.Cluster != nil {
+		originID = b.conf.Cluster.BrokerID
+	}
+	offsets, version, err := pl.appendLocalBatch(originID, values)
+	return offsets, version, pl.useDelta, err
 }
 
 // Fetch reads records from the partition log starting at the supplied offset.
@@ -512,6 +557,54 @@ func (b *Broker) Topics() []string {
 		out = append(out, topic)
 	}
 	return out
+}
+
+// PartitionCommitVersions returns the commit versions covering a contiguous offset range.
+func (b *Broker) PartitionCommitVersions(topic string, partition int, start uint64, count int) ([]uint64, error) {
+	pl, err := b.getPartition(topic, partition)
+	if err != nil {
+		return nil, err
+	}
+	return pl.commitVersionsFrom(start, count), nil
+}
+
+// ResyncPartition rebuilds in-memory commit metadata for the specified partition.
+func (b *Broker) ResyncPartition(topic string, partition int) error {
+	pl, err := b.getPartition(topic, partition)
+	if err != nil {
+		return err
+	}
+	return pl.resyncCommitIndex()
+}
+
+// DeltaReplay exposes the transactional log state for debugging and recovery tooling.
+func (b *Broker) DeltaReplay(topic string, partition int) (*deltalog.Replay, error) {
+	pl, err := b.getPartition(topic, partition)
+	if err != nil {
+		return nil, err
+	}
+	replay, err := pl.log.DeltaReplay(context.Background())
+	if err != nil {
+		if errors.Is(err, logstore.ErrTransactionsDisabled) {
+			return nil, ErrTransactionsDisabled
+		}
+		return nil, err
+	}
+	return replay, nil
+}
+
+// PartitionMetrics returns simple observability data for a partition.
+func (b *Broker) PartitionMetrics(topic string, partition int) (PartitionMetrics, error) {
+	pl, err := b.getPartition(topic, partition)
+	if err != nil {
+		return PartitionMetrics{}, err
+	}
+	metrics := PartitionMetrics{NextOffset: pl.nextOffset()}
+	if version, ok := pl.log.DeltaVersion(); ok {
+		v := version
+		metrics.DeltaVersion = &v
+	}
+	return metrics, nil
 }
 
 // stopFollowers asks every follower replicator goroutine to exit.
